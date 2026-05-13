@@ -33,6 +33,7 @@ import {
 import { ensureRecordingFolder } from "./layout.js";
 import { fireWebhookForRecording } from "../webhook/post.js";
 import { emit } from "./events.js";
+import { triggerEnrichment, enrichmentEnabled } from "./enrichment.js";
 import type { RecordingRow } from "@applaud/shared";
 import { sanitizePlaudSummaryMarkdown } from "@applaud/shared";
 
@@ -50,6 +51,13 @@ class Poller {
   private queuedTrigger = false;
   /** Set by trigger(); consumed on next poll past config gate — manual reset + higher Phase 3 probe cap. */
   private pendingManualSync = false;
+  /**
+   * Asset-download counter for the current cycle, used to gate the
+   * post-poll enrichment hook. Bumped from inside processRecording /
+   * tryTranscriptAndSummary whenever an audio or transcript file
+   * actually lands on disk. Reset to 0 at the start of each runOnce.
+   */
+  private cycleNewAssets = 0;
   lastPollAt: number | null = null;
   nextPollAt: number | null = null;
   lastError: string | null = null;
@@ -100,9 +108,14 @@ class Poller {
   private async runOnce(): Promise<void> {
     if (this.inFlight) return;
     this.inFlight = true;
+    this.cycleNewAssets = 0;
     emit("poll_start");
+    let newAssets = 0;
+    let recordingsDirAtPoll: string | null = null;
     try {
-      await this.pollAndProcess();
+      const result = await this.pollAndProcess();
+      newAssets = result.newAssets;
+      recordingsDirAtPoll = result.recordingsDir;
       this.lastError = null;
     } catch (err) {
       if (err instanceof PlaudAuthError) {
@@ -119,6 +132,14 @@ class Poller {
       this.lastPollAt = Date.now();
       this.inFlight = false;
       emit("poll_end");
+      // Fire the downstream enrichment chain ONLY if this cycle actually
+      // produced new audio or transcript downloads. Idle ticks would
+      // otherwise burn `claude -p` cycles on every poll for nothing
+      // (title/speakers/enrich each scan the whole vault). Single-instance
+      // locked inside `enrichment.ts`, so overlapping ticks are safe.
+      if (newAssets > 0 && enrichmentEnabled()) {
+        triggerEnrichment({ recordingsDir: recordingsDirAtPoll });
+      }
       if (this.queuedTrigger) {
         this.queuedTrigger = false;
         void this.runOnce();
@@ -126,9 +147,17 @@ class Poller {
     }
   }
 
-  private async pollAndProcess(): Promise<void> {
+  private async pollAndProcess(): Promise<{
+    newAssets: number;
+    recordingsDir: string | null;
+  }> {
     const cfg = loadConfig();
-    if (!cfg.token || !cfg.recordingsDir || !cfg.setupComplete) return;
+    if (!cfg.token || !cfg.recordingsDir || !cfg.setupComplete) {
+      return {
+        newAssets: this.cycleNewAssets,
+        recordingsDir: cfg.recordingsDir ?? null,
+      };
+    }
 
     const isManualSync = this.pendingManualSync;
     if (isManualSync) this.pendingManualSync = false;
@@ -219,6 +248,11 @@ class Poller {
         }
       }
     }
+
+    return {
+      newAssets: this.cycleNewAssets,
+      recordingsDir: cfg.recordingsDir,
+    };
   }
 
   private async processRecording(row: RecordingRow): Promise<void> {
@@ -243,6 +277,7 @@ class Poller {
 
         const bytes = await downloadAudio(row.id, paths.audioPath);
         markAudioDownloaded(row.id, bytes || row.filesizeBytes);
+        this.cycleNewAssets++;
         emit("recording_new", { recordingId: row.id });
 
         const fresh = getRecordingById(row.id);
@@ -295,6 +330,7 @@ class Poller {
       const txtContent = flattenTranscript(resp.data_result);
       writeFileSync(paths.transcriptTxtPath, txtContent);
       markTranscriptDownloaded(row.id, txtContent);
+      this.cycleNewAssets++;
       wroteTranscript = true;
     }
     if (needSummary) {
@@ -329,6 +365,7 @@ class Poller {
           const txtContent = flattenTranscript(segments);
           writeFileSync(paths.transcriptTxtPath, txtContent);
           markTranscriptDownloaded(row.id, txtContent);
+          this.cycleNewAssets++;
           wroteTranscript = true;
         }
         if (stillNeedSummary && summaryMd) {
