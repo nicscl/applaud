@@ -64,14 +64,22 @@ function getToken(): string {
   return cfg.token;
 }
 
-const USER_AGENT = "applaud/0.1.0 (+https://github.com/rsteckler/applaud)";
+// Plaud's CDN started rejecting the bot-style UA in mid-2026 with a 403 +
+// challenge HTML. The fix is to look like the official web client: a
+// recent Chrome UA plus the matching Origin/Referer. Authorization itself
+// is unchanged (still the JWT we extracted from LevelDB).
+const USER_AGENT =
+  "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36";
+const WEB_ORIGIN = "https://web.plaud.ai";
 
 export async function plaudFetch(pathOrUrl: string, init: FetchInit = {}): Promise<Response> {
   const url = pathOrUrl.startsWith("http") ? pathOrUrl : `${getPlaudApiBase()}${pathOrUrl}`;
   const token = init.authOverride ?? getToken();
   const headers: Record<string, string> = {
-    accept: "application/json",
+    accept: "application/json, text/plain, */*",
     "user-agent": USER_AGENT,
+    origin: WEB_ORIGIN,
+    referer: `${WEB_ORIGIN}/`,
     authorization: `Bearer ${token}`,
     ...init.headers,
   };
